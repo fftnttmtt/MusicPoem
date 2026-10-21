@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta name="spectra-build" content="local-lab-r56">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <meta name="description" content="按原曲小节分析六条分轨情绪，以唤醒度、频谱质心与实时音量生成声音的几何。">
+  <title>MusicPoem — 声音的几何</title>
+  <link rel="stylesheet" href="./style.css?v=local-lab-r56">
+</head>
+<body>
+  <main id="app">
+    <canvas id="stage" aria-label="六声部小节情绪几何：每轨一个图形，横向为各轨独立归一化的唤醒度，纵向为各轨独立归一化的实时频谱质心，面积随统一标尺的实时音量变化。试听示例使用原有整曲模式。"></canvas>
+    <header class="topbar chrome">
+      <a class="wordmark" href="./" aria-label="MusicPoem 首页">MusicPoem<span>声音的几何</span></a>
+      <div class="top-actions">
+        <span class="mode-label" id="prediction-mode"><i id="song-color"></i><span id="mode-label">情绪 / 背景 · 待预测</span></span>
+        <button class="spectrum-toggle" id="spectrum-button" aria-pressed="false" aria-label="显示频谱参考">频谱</button>
+        <button class="icon-button" id="settings-button" aria-label="打开设置" aria-expanded="false" aria-controls="settings-panel" data-icon="sliders"></button>
+        <button class="icon-button" id="fullscreen-button" aria-label="全屏查看" data-icon="expand"></button>
+      </div>
+    </header>
+    <section class="welcome chrome" id="welcome">
+      <div class="welcome-symbol" aria-hidden="true"><span></span></div>
+      <p class="eyebrow">A STUDY OF SOUND & FORM</p>
+      <h1>让声音显形。</h1>
+      <p class="welcome-copy">让每一个声部显形。</p>
+      <div class="welcome-actions"><button class="upload-button" id="choose-initial"><span data-icon="plus"></span>选择音乐</button><button id="demo-button" class="demo-button">试听示例 <span aria-hidden="true">↗</span></button></div>
+      <p class="file-hint">或将音频拖入此处 · 文件仅在本机处理</p>
+    </section>
+    <div class="loading chrome" id="loading" hidden role="status"><span class="loader"></span><p id="loading-text">正在读取声音…</p></div>
+    <div class="track-hud chrome" id="track-hud" hidden><span class="live-dot"></span><span id="mood-label">情绪示例</span><span class="hud-divider"></span><span id="peak-label">等待节拍</span></div>
+    <footer class="player chrome" id="player" hidden>
+      <div class="track-line"><div class="track-name" id="track-name"></div><span id="tempo-label" class="tempo-label">节拍估计中</span></div>
+      <div class="timeline"><span id="current-time">0:00</span><input id="seek" type="range" min="0" max="1000" step="0.1" value="0" aria-label="播放进度"><span id="duration">0:00</span></div>
+      <div class="transport">
+        <button class="icon-button" id="restart-button" aria-label="从头播放" data-icon="restart"></button>
+        <button class="play-button" id="play-button" aria-label="暂停" data-icon="pause"></button>
+        <button class="icon-button" id="replace-button" aria-label="更换音乐" data-icon="upload"></button>
+      </div>
+      <p class="keyboard-hint">空格 暂停 / 播放 <span>← → 快退 / 快进</span><span>F 全屏</span></p>
+    </footer>
+    <div id="panel-scrim" class="panel-scrim" hidden></div>
+    <aside id="settings-panel" class="settings-panel chrome" aria-label="可视化设置" hidden>
+      <div class="panel-heading"><h2>调节声音的形状</h2><button class="icon-button" id="close-settings" aria-label="关闭设置" data-icon="close"></button></div>
+      <div class="setting-group"><p class="group-label">六声部</p>
+        <label class="switch-row" for="stem-mode">分轨小节情绪<input id="stem-mode" type="checkbox" checked><span class="switch" aria-hidden="true"></span></label>
+        <p class="setting-note">六条分轨共用原曲小节。唤醒度向右，频谱质心向上；坐标各轨独立展开，面积跟随实时音量。关闭后使用原整曲模式；更改后重新选择音乐。</p>
+        <label class="range-label" for="sw-weights">SW 权重路径（可选）</label><input class="field-input" id="sw-weights" type="text" placeholder="留空使用 models 中的权重或自动下载" autocomplete="off">
+        <label class="range-label" for="sw-chunk">分离计算块</label><select class="field-input" id="sw-chunk"><option value="0">原配置 · 约 13.35 秒</option><option value="4">4 秒 · 较低显存</option><option value="2">2 秒 · 更低显存</option></select>
+        <label class="switch-row" for="sw-amp">SW GPU 半精度<input id="sw-amp" type="checkbox" checked><span class="switch" aria-hidden="true"></span></label>
+        <label class="range-label" for="shape-size">图形尺寸 <output id="shape-size-value">150%</output></label><input type="range" id="shape-size" min="55" max="160" value="150" step="1">
+        <p class="setting-note" id="build-info">正在检查图形版本…</p>
+      </div>
+      <div class="setting-group" id="legacy-triggers"><p class="group-label">触发与保留</p>
+        <label class="switch-row" for="show-spectrum">显示频谱参考<input id="show-spectrum" type="checkbox" checked><span class="switch" aria-hidden="true"></span></label>
+        <label class="range-label" for="threshold">上升率阈值 <output id="threshold-value">1.2 /s</output></label><input type="range" id="threshold" min="0.1" max="8" value="1.2" step="0.1">
+        <label class="range-label" for="spacing">相近峰间距 x <output id="spacing-value">2 根</output></label><input type="range" id="spacing" min="0" max="12" value="2" step="1">
+        <label class="range-label" for="decay">增量回落门槛 <output id="decay-value">50%</output></label><input type="range" id="decay" min="40" max="99" value="50" step="1">
+        <label class="range-label" for="smoothing">强度平滑 <output id="smoothing-value">40 ms</output></label><input type="range" id="smoothing" min="10" max="150" value="40" step="5">
+        <label class="range-label" for="birth-window">出生短窗 <output id="birth-window-value">±60 ms</output></label><input type="range" id="birth-window" min="20" max="120" value="60" step="5">
+        <label class="range-label" for="fade-in">基准淡入 <output id="fade-in-value">180 ms · 升起 509 ms</output></label><input type="range" id="fade-in" min="60" max="500" value="180" step="10">
+        <label class="range-label" for="fade-out">基准淡出 <output id="fade-out-value">180 → 509 ms</output></label><input type="range" id="fade-out" min="60" max="600" value="180" step="10">
+        <p class="setting-note">仅在拍点短窗内取上升率峰。背景声取短窗前 150 ms 的三柱最大强度中位数；绑定柱及左右各一根柱的最大强度减去背景声，作为当前增量。至少保留一拍，增量降到其峰值的设定比例并持续 50 ms 后淡出。到拍点先以 35% 不透明度显现，按基准淡入时长变为完整可见；显现不再受质量拖慢。升起和淡出下落仍受质量控制。</p>
+      </div>
+      <div class="setting-group" id="legacy-motion"><p class="group-label">泡泡运动</p>
+        <label class="range-label" for="position-gamma">位置 γ <output id="position-gamma-value">0.50</output></label><input type="range" id="position-gamma" min="0.1" max="2" value="0.5" step="0.05">
+        <p class="setting-note">默认 0.5，拉开低强度图形的纵向间距；1 为线性分布，数值越小越向上展开。</p>
+        <label class="range-label" for="mass">惯性质量 <output id="mass-value">8.0</output></label><input type="range" id="mass" min="1" max="8" value="8" step="0.5">
+        <label class="range-label" for="breath">升降幅度 <output id="breath-value">100%</output></label><input type="range" id="breath" min="40" max="180" value="100" step="5">
+        <label class="range-label" for="hover-strength">悬浮强度 <output id="hover-strength-value">400%</output></label><input type="range" id="hover-strength" min="0" max="500" value="400" step="10">
+        <p class="setting-note">淡入时减速上升，到达最高点后轻微上下浮动，100% 时幅度约 2–4 px，默认 400%，0% 关闭；每 2–4 秒一周期，随播放时间运行，慢拍也持续浮动；淡出时平滑接续下落。每个图形相位不同，横向位置固定，出生位置纵向展开。到达最高点后约 4 拍逐渐变透明，保持时最低不透明度为 25%；退场时继续淡出至消失。质量越大，升起和下落的加速度越小，实际运动时间越长；升降幅度保持不变。默认质量为最大值 8。</p>
+      </div>
+      <div class="setting-group"><p class="group-label">节拍</p>
+        <label class="switch-row" for="beat-clicks">拍点对照音<input id="beat-clicks" type="checkbox" checked><span class="switch" aria-hidden="true"></span></label>
+        <label class="range-label" for="tail-silence">尾部静音阈值 <output id="tail-silence-value">-50 dBFS</output></label><input type="range" id="tail-silence" min="-70" max="-25" value="-50" step="1">
+        <p class="setting-note">末尾持续低于阈值 150 ms 后，图形从当前位置按当前质量和淡出设置下落淡出，并停止剩余节拍音；只检测后面不再恢复声音的尾部。持续超过一拍的图形，从后续拍点起轻微膨胀、收缩一次。</p>
+        <p class="setting-note">对照音使用当前同一组拍点。点击声若也不合拍，请先检查预测拍点；并非每拍都会新生图形，已有图形可能被保留或刷新。</p>
+        <div class="range-label"><label for="bpm">速度</label><div><output id="bpm-value">120.0 BPM</output><button id="auto-bpm" class="text-button" aria-pressed="true">自动</button></div></div><input type="range" id="bpm" min="30" max="240" value="120" step="0.1">
+        <label class="range-label" for="beat-offset">拍点偏移 <output id="beat-offset-value">0 ms</output></label><input type="range" id="beat-offset" min="-500" max="1000" value="0" step="5">
+        <p class="setting-note" id="beat-source">自动估计 · 可手动校准</p>
+        <button id="choose-beats" class="secondary-button"><span data-icon="upload"></span>导入节拍 JSON</button>
+        <p class="setting-note beat-format">格式：[0.25, 0.75, 1.25]，单位为秒。支持 {"beats": [...]}。未接入完整预测时可单独替换节拍；接入完整预测后，节拍校准锁定，保持颜色节点同步。</p>
+      </div>
+      <div class="setting-group last"><p class="group-label">情绪与颜色预测</p>
+        <label class="switch-row" for="predict-per-beat">按节拍预测（较慢）<input id="predict-per-beat" type="checkbox"><span class="switch" aria-hidden="true"></span></label>
+        <p class="setting-note" id="prediction-note">本机 CUDA · final0 · 默认按小节。</p>
+        <button id="choose-prediction" class="secondary-button"><span data-icon="upload"></span>导入预测 JSON</button>
+        <button id="prediction-download" class="secondary-button" disabled>导出预测 JSON</button>
+        <p class="setting-note beat-format">六声部模式每轨每小节一个图形，最高分标签决定形状；填充色沿用 HSV 与 Foote 过渡，描边保留标签配色，背景为黑色。原模式保留原有图形配额与背景色。</p>
+      </div>
+    </aside>
+    <div id="drop-overlay" class="drop-overlay" hidden><span data-icon="upload"></span><p>松开，开始聆听。</p></div>
+    <div class="toast chrome" id="toast" hidden role="status" aria-live="polite"></div>
+    <input type="file" id="prediction-input" accept="application/json,.json" hidden>
+    <input type="file" id="beat-input" accept="application/json,.json" hidden>
+    <input type="file" id="file-input" accept="audio/*,.mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.aiff" hidden>
+    <button id="exit-focus" aria-label="退出全屏" data-icon="collapse" hidden></button>
+  </main>
+  <script type="module" src="./app.js?v=local-lab-r56"></script>
+</body>
+</html>
