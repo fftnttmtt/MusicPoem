@@ -1,0 +1,2 @@
+# Embedded V8/WASM; official wheels include Windows x64 Python 3.10/3.11.
+mini-racer==0.12.4
