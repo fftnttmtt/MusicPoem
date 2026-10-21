@@ -1,0 +1,356 @@
+"""CLI entry point for BS-Roformer inference -- folder-batch separation and output manifests.
+
+Weights auto-resolve: when --model_path/--config_path are omitted, the requested
+registry model (default: the recommended SW model) is looked up in the models dir
+($BS_ROFORMER_MODELS_PATH > ~/.cache/bs-roformer-infer > legacy ./models) and
+downloaded sha256-verified on first use via download.ensure_model_assets --
+explicit paths always win and skip all of that.
+Training configs sometimes embed `!!python/tuple` YAML tags; SafeLoaderWithTuple
+downgrades those to plain lists so `yaml.load` never has to execute an arbitrary
+Python-object constructor, and utils.get_model_from_config converts the needed
+params back to tuples afterward. `_select_device` resolves `None`/`auto` to
+cuda-else-cpu and raises on an explicitly requested accelerator that is
+unavailable rather than silently downgrading it -- `device="mps"` always raises
+(MLX/MPS support was removed org-wide, 2026-09-14). `run_folder()` owns folder
+iteration, stem naming, instrumental derivation, the manifest, and the chunked
+Torch inference itself (via utils.demix_track) in one place, and returns an
+immutable manifest of the files it actually
+writes, derived from the loaded config and successful writes rather than guessed
+registry metadata. `output_format` controls the written subtype/suffix
+(`_OUTPUT_FORMAT_WRITERS` is the single source of truth) -- defaults to
+`"wav_float32"` everywhere in this package so existing callers keep today's
+behavior unless they opt in.
+
+Reads: .utils (demix_track, get_model_from_config, load_checkpoint_state),
+.download (ensure_model_assets), .checkpoints (checkpoint_metadata),
+.model_registry (DEFAULT_MODEL), yaml, ml_collections, torch
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import soundfile as sf
+import torch
+import torch.nn as nn
+import yaml
+from ml_collections import ConfigDict
+from tqdm import tqdm
+
+from .checkpoints import checkpoint_metadata
+from .download import ensure_model_assets
+from .model_registry import DEFAULT_MODEL
+from .utils import demix_track, get_model_from_config, load_checkpoint_state
+
+
+class SafeLoaderWithTuple(yaml.SafeLoader):
+    """YAML loader that treats !!python/tuple as a list (which utils.py converts to tuple)."""
+    pass
+
+
+def _tuple_constructor(loader, node):
+    """Convert !!python/tuple to a list; utils.py will convert to tuple later."""
+    return loader.construct_sequence(node)
+
+
+SafeLoaderWithTuple.add_constructor('tag:yaml.org,2002:python/tuple', _tuple_constructor)
+
+DEFAULT_OUTPUT_FORMAT = "wav_float32"
+
+# Single source of truth mapping a resolved `output_format` value to the file suffix
+# and soundfile `subtype` that produce it. FLAC has no float subtype (soundfile/
+# libsndfile only support PCM_S8/16/24 for FLAC), so "flac16" is PCM_16 by design,
+# not a limitation to work around.
+_OUTPUT_FORMAT_WRITERS: dict[str, tuple[str, str]] = {
+    "wav_float32": (".wav", "FLOAT"),
+    "wav_s16": (".wav", "PCM_16"),
+    "flac16": (".flac", "PCM_16"),
+}
+
+
+def _resolve_output_writer(output_format: str) -> tuple[str, str]:
+    try:
+        return _OUTPUT_FORMAT_WRITERS[output_format]
+    except KeyError:
+        raise ValueError(
+            f"unsupported output_format: {output_format!r} "
+            f"(expected one of {sorted(_OUTPUT_FORMAT_WRITERS)})"
+        ) from None
+
+
+def _ensure_wav_inputs(input_folder: Path) -> list[Path]:
+    if not input_folder.exists():
+        raise FileNotFoundError(f"Input folder not found: {input_folder}")
+    wav_files = sorted(input_folder.glob("*.wav"))
+    if not wav_files:
+        raise FileNotFoundError(f"No .wav files found in {input_folder}")
+    return wav_files
+
+
+def _resolve_output_dir(store_dir: Path) -> Path:
+    store_dir.mkdir(parents=True, exist_ok=True)
+    return store_dir
+
+
+def _format_iterable(paths: Iterable[Path], verbose: bool) -> Iterable[Path]:
+    return tqdm(paths, desc="Tracks", unit="track") if not verbose else paths
+
+
+@dataclass(frozen=True)
+class OutputFile:
+    input_path: str
+    output_id: str
+    output_path: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "input_path": self.input_path,
+            "output_id": self.output_id,
+            "output_path": self.output_path,
+        }
+
+
+@dataclass(frozen=True)
+class OutputManifest:
+    outputs: tuple[OutputFile, ...]
+
+    def as_dict(self) -> dict[str, list[dict[str, str]]]:
+        return {"outputs": [output.as_dict() for output in self.outputs]}
+
+
+def _configured_output_ids(config: ConfigDict) -> list[str]:
+    output_ids = list(config.training.instruments)
+    target_instrument = getattr(config.training, "target_instrument", None)
+    if target_instrument is not None:
+        output_ids = [target_instrument]
+    return output_ids
+
+
+def _append_output(
+    outputs: list[OutputFile],
+    *,
+    input_path: Path,
+    output_id: str,
+    output_path: Path,
+) -> None:
+    outputs.append(
+        OutputFile(
+            input_path=str(input_path),
+            output_id=output_id,
+            output_path=str(output_path),
+        )
+    )
+
+
+def run_folder(
+    model, args, config, device, verbose: bool = False, output_format: str = DEFAULT_OUTPUT_FORMAT
+) -> OutputManifest:
+    """Separate every WAV in a folder with the shipped Torch model. Signature unchanged.
+
+    Owns folder iteration, stem naming, instrumental derivation, the manifest, and
+    the chunked Torch inference itself (via utils.demix_track) in one place --
+    everything a stem's filename, the derived instrumental, and the returned
+    manifest depend on is decided here, once. `output_format` controls the written
+    suffix/subtype via `_OUTPUT_FORMAT_WRITERS`.
+    """
+    start_time = time.time()
+    suffix, subtype = _resolve_output_writer(output_format)
+
+    model.eval()
+
+    input_folder = Path(args.input_folder).expanduser()
+    store_dir = _resolve_output_dir(Path(args.store_dir).expanduser())
+    all_mixtures_path = _ensure_wav_inputs(input_folder)
+    total_tracks = len(all_mixtures_path)
+    print(f"Total tracks found: {total_tracks}")
+
+    output_ids = _configured_output_ids(config)
+
+    iterable = _format_iterable(all_mixtures_path, verbose)
+
+    outputs: list[OutputFile] = []
+    first_chunk_time = None
+
+    for track_number, path in enumerate(iterable, 1):
+        print(f"\nProcessing track {track_number}/{total_tracks}: {path.name}")
+
+        mix, sr = sf.read(path)
+        original_mix = mix
+        original_mono = False
+        if len(mix.shape) == 1:
+            original_mono = True
+            mix = np.stack([mix, mix], axis=-1)
+
+        mixture = torch.tensor(mix.T, dtype=torch.float32)
+
+        if first_chunk_time is not None:
+            total_length = mixture.shape[1]
+            step = config.inference.chunk_size // config.inference.num_overlap
+            num_chunks = (total_length + step - 1) // step
+            estimated_total_time = first_chunk_time * num_chunks
+            print(f"Estimated total processing time for this track: {estimated_total_time:.2f} seconds")
+            sys.stdout.write(f"Estimated time remaining: {estimated_total_time:.2f} seconds\r")
+            sys.stdout.flush()
+
+        res, first_chunk_time = demix_track(config, model, mixture, device, first_chunk_time)
+
+        for output_id in output_ids:
+            output_audio = res[output_id].T
+            if original_mono:
+                output_audio = output_audio[:, 0]
+
+            output_path = store_dir / f"{path.stem}_{output_id}{suffix}"
+            sf.write(output_path, output_audio, sr, subtype=subtype)
+            _append_output(
+                outputs,
+                input_path=path,
+                output_id=output_id,
+                output_path=output_path,
+            )
+
+        if "vocals" in output_ids and "instrumental" not in output_ids:
+            vocals_output = res["vocals"].T
+            if original_mono:
+                vocals_output = vocals_output[:, 0]
+
+            instrumental = original_mix - vocals_output
+
+            instrumental_path = store_dir / f"{path.stem}_instrumental{suffix}"
+            sf.write(instrumental_path, instrumental, sr, subtype=subtype)
+            _append_output(
+                outputs,
+                input_path=path,
+                output_id="instrumental",
+                output_path=instrumental_path,
+            )
+
+    time.sleep(1)
+    print("Elapsed time: {:.2f} sec".format(time.time() - start_time))
+    return OutputManifest(outputs=tuple(outputs))
+
+
+def proc_folder(args) -> OutputManifest:
+    parser = argparse.ArgumentParser(description="BS-Roformer inference runner")
+    parser.add_argument("--model_type", type=str, default="bs_roformer")
+    parser.add_argument("--config_path", type=Path, default=None,
+                        help="path to config yaml file (omit to auto-resolve from --model)")
+    parser.add_argument("--model_path", type=Path, default=None,
+                        help="path to the .ckpt weights (omit to auto-resolve from --model)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="registry model slug/name to auto-resolve when paths are omitted "
+                             f"(default: {DEFAULT_MODEL})")
+    parser.add_argument("--models_dir", type=Path, default=None,
+                        help="directory holding downloaded model assets "
+                             "(default: $BS_ROFORMER_MODELS_PATH or ~/.cache/bs-roformer-infer; "
+                             "a legacy ./models directory is also searched)")
+    parser.add_argument("--input_folder", type=Path, required=True, help="folder with songs to process")
+    parser.add_argument("--store_dir", type=Path, default=Path("outputs"), help="path to store model outputs")
+    parser.add_argument("--device", type=str, default=None,
+                        help=f"torch device: {DEVICE_CHOICES} (default: auto)")
+    parser.add_argument("--device_ids", nargs='+', type=int, help='optional list of gpu ids for DataParallel')
+    parser.add_argument("--output_format", type=str, default=DEFAULT_OUTPUT_FORMAT,
+                        choices=sorted(_OUTPUT_FORMAT_WRITERS),
+                        help="output file format/subtype for written stems "
+                             f"(default: {DEFAULT_OUTPUT_FORMAT})")
+    if args is None:
+        args = parser.parse_args()
+    elif isinstance(args, argparse.Namespace):
+        # Already parsed, use as is
+        pass
+    else:
+        args = parser.parse_args(args)
+
+    _resolve_model_assets(args, parser)
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+
+    with open(args.config_path) as f:
+        config = ConfigDict(yaml.load(f, Loader=SafeLoaderWithTuple))
+
+    print(f"Using model weights: {args.model_path}")
+
+    model = get_model_from_config(
+        args.model_type,
+        config,
+        model_variation=getattr(args, "model_variation", None),
+    )
+    model.load_state_dict(
+        load_checkpoint_state(args.model_path, map_location=torch.device("cpu"))
+    )
+    device = _select_device(args)
+    if args.device_ids:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for --device_ids usage")
+        model = nn.DataParallel(model, device_ids=args.device_ids).to(device)
+    else:
+        model = model.to(device)
+
+    return run_folder(
+        model, args, config, device, verbose=False,
+        output_format=getattr(args, "output_format", DEFAULT_OUTPUT_FORMAT),
+    )
+
+
+def _resolve_model_assets(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Fill in args.model_path/args.config_path, auto-downloading when both are omitted."""
+    model_path = getattr(args, "model_path", None)
+    config_path = getattr(args, "config_path", None)
+    if (model_path is None) != (config_path is None):
+        parser.error("--model_path and --config_path must be given together "
+                     "(or both omitted to auto-resolve)")
+    if model_path is not None:
+        if getattr(args, "model", None):
+            parser.error("--model selects a registry model to auto-resolve; "
+                         "it cannot be combined with explicit --model_path/--config_path")
+        args.model_variation = None
+        return
+    model_key = getattr(args, "model", None) or DEFAULT_MODEL
+    args.model_path, args.config_path = ensure_model_assets(
+        model_key, models_dir=getattr(args, "models_dir", None)
+    )
+    args.model = model_key
+    args.model_variation = checkpoint_metadata(model_key).get("variation")
+
+
+DEVICE_CHOICES = "None, 'auto', 'cpu', 'cuda', or 'cuda:N'"
+
+
+def _select_device(args: argparse.Namespace) -> torch.device:
+    requested = getattr(args, "device", None)
+    if isinstance(requested, torch.device):
+        return requested
+    if requested is None or requested == "auto":
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "mps":
+        raise ValueError(
+            "device='mps' is not supported: MLX/MPS support was removed "
+            f"(org decision 2026-09-14); device must be {DEVICE_CHOICES}"
+        )
+    if not isinstance(requested, str) or not requested.startswith("cuda"):
+        raise ValueError(f"device must be {DEVICE_CHOICES}")
+    suffix = requested[4:]
+    if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+        raise ValueError(f"device must be {DEVICE_CHOICES}")
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA was explicitly requested ({requested}) but is unavailable")
+    if suffix and int(suffix[1:]) >= torch.cuda.device_count():
+        raise RuntimeError(f"CUDA device index {suffix[1:]} is unavailable")
+    return torch.device(requested)
+
+
+def main():
+    """Main entry point for the BS-Roformer inference script."""
+    proc_folder(None)
+
+
+if __name__ == "__main__":
+    main()

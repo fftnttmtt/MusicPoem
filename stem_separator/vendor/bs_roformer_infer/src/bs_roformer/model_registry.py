@@ -1,0 +1,128 @@
+"""Model registry -- checkpoint/config/category metadata for every BS-Roformer variant.
+
+Backed by package-owned config/checkpoints.toml so new models can be added without a
+code change. `get()` accepts a slug, friendly name, or checkpoint filename
+interchangeably, since callers (the download CLI, this package's `__init__`) rarely
+agree on which key they have handy. `BSModel.default_sources` maps category ->
+expected raw model outputs only; inference-time derived files like
+`*_instrumental.wav` belong to run_folder() manifests instead.
+
+Reads: checkpoints.py
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+_PACKAGE_ROOT = Path(__file__).resolve().parent
+
+
+MVSep_MEGA_53_STEMS = [
+    "accordion", "acoustic-guitar", "back-vocal", "banjo", "bass", "bassoon",
+    "bells", "bowed_strings", "brass", "cello", "clarinet", "congas",
+    "digital-piano", "dobro", "double-bass", "drums", "electric-guitar",
+    "flute", "french-horn", "glockenspiel", "guitar", "harmonica", "harp",
+    "harpsichord", "hh", "keys", "kick", "lead-vocal", "mandolin", "marimba",
+    "oboe", "organ", "percussion", "piano", "saxophone", "sitar", "snare",
+    "strings", "synth", "tambourine", "timpani", "toms", "triangle",
+    "trombone", "trumpet", "tuba", "ukulele", "viola", "violin", "vocal",
+    "wind", "wind-chimes", "woodwind",
+]
+
+
+@dataclass(frozen=True)
+class BSModel:
+    slug: str
+    name: str
+    checkpoint: str
+    config: str
+    category: str
+    variation: str = "mlp"
+
+    @property
+    def default_sources(self) -> List[str]:
+        if self.category == "mega-stem":
+            return list(MVSep_MEGA_53_STEMS)
+        if self.category == "four-stem":
+            return ["drums", "bass", "other", "vocals"]
+        if self.category == "multi-stem":
+            return ["bass", "drums", "other", "vocals", "guitar", "piano"]
+        if self.category in {"instrumental"}:
+            return ["instrumental", "vocals"]
+        if self.category in {"karaoke", "vocals"}:
+            return ["vocals", "other"]
+        if self.category == "dereverb":
+            return ["dry", "wet"]
+        return ["vocals", "other"]
+
+
+class ModelRegistry:
+    def __init__(self):
+        from .checkpoints import load_checkpoints
+        data = load_checkpoints()
+        self._models: Dict[str, BSModel] = {}
+        for slug, meta in data["models"].items():
+            model = BSModel(
+                slug=slug,
+                name=meta["name"],
+                checkpoint=next(a["name"] for a in meta["artifacts"] if a["kind"] == "checkpoint"),
+                config=next(a["name"] for a in meta["artifacts"] if a["kind"] == "config"),
+                category=meta.get("category", "general"),
+                variation=meta.get("variation", "mlp"),
+            )
+            self._models[slug] = model
+        # simple lookup by normalized name or checkpoint
+        self._by_name = {model.name.lower(): model.slug for model in self._models.values()}
+        self._by_checkpoint = {model.checkpoint.lower(): model.slug for model in self._models.values()}
+
+    def list(self, category: Optional[str] = None) -> List[BSModel]:
+        if category is None:
+            return sorted(self._models.values(), key=lambda m: m.name)
+        return sorted(
+            (m for m in self._models.values() if m.category == category.lower()),
+            key=lambda m: m.name,
+        )
+
+    def categories(self) -> List[str]:
+        return sorted({m.category for m in self._models.values()})
+
+    def get(self, key: str) -> BSModel:
+        normalized = key.lower()
+        if normalized in self._models:
+            return self._models[normalized]
+        if normalized in self._by_name:
+            return self._models[self._by_name[normalized]]
+        if normalized in self._by_checkpoint:
+            return self._models[self._by_checkpoint[normalized]]
+        raise KeyError(f"Unknown BS-Roformer model: {key}")
+
+    def search(self, term: str) -> List[BSModel]:
+        normalized = term.lower()
+        return [
+            m for m in self._models.values()
+            if normalized in m.name.lower() or normalized in m.checkpoint.lower()
+        ]
+
+    def as_table(self, category: Optional[str] = None) -> str:
+        rows = self.list(category)
+        if not rows:
+            return "No models registered."
+        name_w = max(len(m.name) for m in rows)
+        cat_w = max(len(m.category) for m in rows)
+        lines = [f"{'Name'.ljust(name_w)}  {'Category'.ljust(cat_w)}  Checkpoint"]
+        lines.append("-" * len(lines[0]))
+        for model in rows:
+            lines.append(
+                f"{model.name.ljust(name_w)}  {model.category.ljust(cat_w)}  {model.checkpoint}"
+            )
+        return "\n".join(lines)
+
+
+MODEL_REGISTRY = ModelRegistry()
+
+# Default model - BS-RoFormer-SW is recommended for best vocal separation quality
+DEFAULT_MODEL = "roformer-model-bs-roformer-sw-by-jarredou"
+
+__all__ = ["BSModel", "ModelRegistry", "MODEL_REGISTRY", "DEFAULT_MODEL"]
